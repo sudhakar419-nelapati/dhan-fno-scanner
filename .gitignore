@@ -1,0 +1,17 @@
+# Secrets: never commit these
+config/.env
+.env
+.streamlit/secrets.toml
+
+# Downloaded and cached market data
+data/
+
+# Virtual environments and IDE files
+.venv/
+Lib/
+Scripts/
+pyvenv.cfg
+CACHEDIR.TAG
+.idea/
+*.iml
+__pycache__/
