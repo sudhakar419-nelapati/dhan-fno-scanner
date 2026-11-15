@@ -197,8 +197,8 @@ def show_all_options(df):
         return
 
     def tint(row):
-        return ["background-color: #e8f6e8" if c.startswith("CE") else
-                "background-color: #fdeaea" if c.startswith("PE") else "" for c in row.index]
+        return ["background-color: #e8f6e8; color: #1a1a1a" if c.startswith("CE") else
+                "background-color: #fdeaea; color: #1a1a1a" if c.startswith("PE") else "" for c in row.index]
 
     formats = {c: "{:g}" for c in ("Strike", "Score", "Rank", "CE lots", "PE lots")}
     styled = df.style.format(formats, precision=2, na_rep="-").apply(tint, axis=1)
@@ -235,8 +235,8 @@ def show_picks(df):
 
     def mark(row):
         go = str(row["Timing"]).endswith("Go") and row["Tradable"] == "Yes"
-        return ["background-color: #e8f6e8" if go and c in ("Symbol", "Timing") else
-                "background-color: #ffe9a8" if row["Alert"] and c == "Alert" else ""
+        return ["background-color: #e8f6e8; color: #1a1a1a" if go and c in ("Symbol", "Timing") else
+                "background-color: #ffe9a8; color: #1a1a1a" if row["Alert"] and c == "Alert" else ""
                 for c in row.index]
 
     formats = {"Lot cost": "{:,.0f}", "Scanner": "{:g}", "Opt lots": "{:,.0f}", "IV %": "{:.1f}"}
@@ -292,11 +292,11 @@ def show(title, df):
     df.insert(df.columns.get_loc("Symbol") + 1, "Alert", alerts(df))
 
     def wide_spread(v):
-        return "background-color: #fde2e2" if pd.notna(v) and v > max_spread else ""
+        return "background-color: #fde2e2; color: #1a1a1a" if pd.notna(v) and v > max_spread else ""
 
     def at_wall(row):
         near = pd.notna(row.get("Room %")) and row["Room %"] <= wall_near
-        return ["background-color: #ffe9a8" if near and c in ("Symbol", "Alert", "Wall", "Room %")
+        return ["background-color: #ffe9a8; color: #1a1a1a" if near and c in ("Symbol", "Alert", "Wall", "Room %")
                 else "" for c in row.index]
 
     # Gamma values are small (around 0.0005 to 0.02), so they need more decimals than the rest.
