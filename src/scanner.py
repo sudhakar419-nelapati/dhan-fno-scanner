@@ -10,9 +10,11 @@ from dhan_api import now_ist, option_chain, quotes
 
 SESSION_MIN = 375  # 09:15 to 15:30
 # Score weights and the move that earns full marks for each factor.
-W_PRICE, FULL_PRICE_PCT = 40, 3.0   # 3% futures move
+# The price and volume marks keep rising up to a 6% move and 6x volume, so an exceptional
+# mover scores clearly above an ordinary one instead of both hitting the ceiling.
+W_PRICE, FULL_PRICE_PCT = 40, 6.0   # 6% futures move
 W_OI, FULL_OI_PCT = 30, 8.0         # 8% OI addition
-W_VOL, FULL_VOL_X = 30, 3.0         # 3x normal volume
+W_VOL, FULL_VOL_X = 30, 6.0         # 6x normal volume
 
 
 def session_fraction():
@@ -25,6 +27,8 @@ def session_fraction():
 
 
 def _signal(pct, oi_chg):
+    if pct == 0:
+        return "Flat"
     if pd.isna(oi_chg):
         return "Price up" if pct > 0 else "Price down"
     if pct > 0:
@@ -52,8 +56,11 @@ def scan(universe, baseline):
 
         b = base.get(r.symbol, {})
         oi = f.get("oi")
-        # After market close the latest daily candle already equals live OI; step back one day.
-        ref_oi = b.get("oi_prev") if oi == b.get("oi_last") else b.get("oi_last")
+        # In market hours the reference is always the last daily candle (yesterday's close),
+        # even if OI has not moved yet. With the market closed the last daily candle can be
+        # the session just ended, which then equals live OI: step back one day.
+        closed_same = frac == 1.0 and oi == b.get("oi_last")
+        ref_oi = b.get("oi_prev") if closed_same else b.get("oi_last")
         oi_chg = (oi / ref_oi - 1) * 100 if oi and ref_oi and ref_oi == ref_oi else float("nan")
 
         vol, avg = e.get("volume"), b.get("vol_avg10")
@@ -66,7 +73,8 @@ def scan(universe, baseline):
             score += W_VOL * min(max(vol_x - 1, 0) / (FULL_VOL_X - 1), 1)
 
         rows.append({
-            "Symbol": r.symbol, "Side": "CE" if pct > 0 else "PE", "Score": round(score),
+            "Symbol": r.symbol, "Side": "CE" if pct > 0 else "PE" if pct < 0 else "-",
+            "Score": round(score),
             "Signal": _signal(pct, oi_chg), "Fut LTP": ltp, "Chg %": round(pct, 2),
             "OI chg %": round(oi_chg, 2), "Vol x": round(vol_x, 2),
             "eq_id": r.eq_id, "fut_id": r.fut_id, "lot": r.lot, "expiry": r.expiry,
@@ -106,7 +114,9 @@ def _spread_pct(q):
     """Bid-ask gap as a % of the premium, from the top of the order book."""
     try:
         bid, ask = q["depth"]["buy"][0]["price"], q["depth"]["sell"][0]["price"]
-        return round((ask - bid) / q["last_price"] * 100, 2) if bid and ask and q["last_price"] else None
+        if not bid or not ask or ask < bid or not q["last_price"]:   # empty or crossed book
+            return None
+        return round((ask - bid) / q["last_price"] * 100, 2)
     except (KeyError, IndexError, TypeError):
         return None
 
@@ -118,11 +128,13 @@ def _spread_ticks(q, tick):
     """Bid-ask gap in price steps (ticks), or None if the order book is empty."""
     try:
         bid, ask = q["depth"]["buy"][0]["price"], q["depth"]["sell"][0]["price"]
-        return round((ask - bid) / tick) if bid and ask else None
+        tick = tick if tick and tick > 0 else 0.05               # a missing step size
+        return round((ask - bid) / tick) if bid and ask and ask >= bid else None
     except (KeyError, IndexError, TypeError):
         return None
 
 
+MIN_MOVE_PCT = 0.25       # a future that has moved less than this is treated as flat
 MIN_OPTION_LOTS = 200     # lots traded in a full day below which an option counts as thin
 RISK_FREE = 0.065         # yearly rate used when estimating implied volatility
 
@@ -173,36 +185,40 @@ def _go_streak(symbol, side, is_go, scan_id):
 
 
 def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=1.5, wall_near=1.0,
-              min_score=50, scan_id=None):
+              min_score=35, scan_id=None):
     """The short list to act on, built in three stages:
-      1. SCAN: the `pool` highest-scoring stocks on each side from the futures scan,
-         leaving out any below `min_score`;
+      1. SCAN: the highest-scoring stocks on each side from the futures scan, leaving out
+         any below `min_score`; `pool` per side go forward, tradable options first;
       2. TIMING: `timing(fut_id, side)` checks the future's 5-minute candles (4 checks);
       3. TRADABILITY: the ATM option's spread, volume, cost, implied volatility and OI wall.
+    `timing` returns a "tier" (2 = Go, 1 = Almost, 0 = Wait) with its text.
     Timing is a gate on the order, not a blended score: 'Go' rows come first, then 'Almost',
     then 'Wait', each group in scanner-score order with tradable options ahead of the rest."""
     by_symbol, lots = _strike_table(options)
     live = session_fraction() < 1.0
     ticks_by_id = (dict(zip(options["sec_id"].astype(int), options["tick"]))
                    if "tick" in options.columns else {})
-    rows = []
-    for s in (("CE", "PE") if side == "All" else (side,)):
-        strong = res[(res["Side"] == s) & (res["Score"] >= min_score)]
-        for r in strong.head(pool).to_dict("records"):
+    sides = ("CE", "PE") if side == "All" else (side,)
+    # Twice the pool is looked at per side, so a stock with an untradable option does not
+    # block a tradable one just below it. A near-flat stock is not a momentum candidate.
+    cands = []
+    for s in sides:
+        strong = res[(res["Side"] == s) & (res["Score"] >= min_score)
+                     & (res["Chg %"].abs() >= MIN_MOVE_PCT)]
+        for r in strong.head(pool * 2).to_dict("records"):
             g, spot = by_symbol.get(r["Symbol"]), r.get("eq_ltp")
             if g is None or pd.isna(spot) or not spot:
                 continue
             k = g.iloc[(g["strike"] - spot).abs().argmin()]
-            rows.append({**r, "strike": float(k["strike"]), "sec_id": int(k[s]),
-                         "opt_lot": lots.get(r["Symbol"])})
-    if not rows:
+            cands.append({**r, "strike": float(k["strike"]), "sec_id": int(k[s]),
+                          "opt_lot": lots.get(r["Symbol"])})
+    if not cands:
         return pd.DataFrame()
 
-    q = quotes({"NSE_FNO": [r["sec_id"] for r in rows]}).get("NSE_FNO", {})
+    # Tradability first: one quote call covers every candidate's option.
+    q = quotes({"NSE_FNO": [r["sec_id"] for r in cands]}).get("NSE_FNO", {})
     need_lots = max(MIN_OPTION_LOTS * session_fraction(), 20)   # scaled to the time of day
-    for r in rows:
-        r.update(timing(int(r["fut_id"]), r["Side"]))
-        r["streak"], r["since"] = _go_streak(r["Symbol"], r["Side"], r["passed"] == 4, scan_id)
+    for r in cands:
         oq = q.get(str(r["sec_id"])) or {}
         r["premium"] = oq.get("last_price")
         # After the close the order book holds only leftover orders, so no spread is shown.
@@ -223,7 +239,17 @@ def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=1.
         if (r["spread"] is not None and r["spread"] > max_spread
                 and (ticks is None or ticks > MAX_TICKS_OK)):
             r["problems"].append(f"Wide spread {r['spread']}%")
-        r["tier"] = {4: 2, 3: 1}.get(r["passed"], 0)
+
+    # Each side's pool: tradable options by scanner score, topped up with untradable ones
+    # only when fewer than `pool` are tradable. Timing is then checked for the pool alone.
+    rows = []
+    for s in sides:
+        mine = [r for r in cands if r["Side"] == s]          # already in score order
+        rows += ([r for r in mine if not r["problems"]] + [r for r in mine if r["problems"]])[:pool]
+    for r in rows:
+        r.update(timing(int(r["fut_id"]), r["Side"]))
+        r["tier"] = r.get("tier") or 0                      # 2 = Go, 1 = Almost, 0 = Wait
+        r["streak"], r["since"] = _go_streak(r["Symbol"], r["Side"], r["tier"] == 2, scan_id)
     rows.sort(key=lambda r: (r["tier"], not r["problems"], r["Score"]), reverse=True)
     rows = rows[:count]
 
@@ -247,13 +273,16 @@ def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=1.
             notes.append(f"At wall {wall:g} ({room}%)")
         cost = r["premium"] * r["opt_lot"] if r["premium"] and r["opt_lot"] else None
         out.append({
-            "Pick": n, "Symbol": r["Symbol"], "Scanner": r["Score"], "Signal": r["Signal"],
+            "Pick": n, "Symbol": r["Symbol"], "Scanner": r["Score"],
+            "Chg %": r["Chg %"], "Vol x": r["Vol x"], "Signal": r["Signal"],
             "Timing": r["Timing"], "Streak": r["streak"], "Since": r["since"],
             "Missing": r["Missing"],
             "Buy": f"{r['strike']:g} {r['Side']}", "Premium": r["premium"], "Lot cost": cost,
             "IV %": r["iv"], "Opt lots": r["opt_lots"], "Spread %": r["spread"],
             "Tradable": "No" if r["problems"] else "Yes", "Alert": ", ".join(notes),
             "Wall": wall, "Room %": room, "Candle": r["Candle"],
+            # Kept for the scan log, not shown in the table.
+            "Side": r["Side"], "sec_id": r["sec_id"], "Fut LTP": r["Fut LTP"],
         })
     return pd.DataFrame(out)
 

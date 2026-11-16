@@ -12,7 +12,11 @@ MIN_CANDLES = 30
 RSI_UP, RSI_DOWN = 55, 45
 MIN_REL_VOLUME = 1.2           # average of the last three candles against the same time on earlier days
 SLOT_SESSIONS, SLOT_MIN_SESSIONS, SESSION_WINDOW = 5, 2, 20
-LABELS = {"trend": "trend", "vwap": "VWAP", "volume": "volume", "rsi": "RSI"}
+# Until this time the indicators rest mostly on yesterday's candles, so one more check is
+# added: the future must have closed beyond the day's first 5-minute candle.
+EARLY_UNTIL = "09:45"
+LABELS = {"trend": "trend", "vwap": "VWAP", "volume": "volume", "rsi": "RSI",
+          "range": "opening range"}
 
 
 def candles(fut_id, days=10):
@@ -65,9 +69,11 @@ def indicators(df):
 
 
 def check(df, side):
-    """Run the four checks on the latest candle for a 'CE' (rising) or 'PE' (falling) pick.
-    Returns {"passed": 0-4 or None, "Timing": text, "Missing": failed checks, "Candle": time}."""
-    blank = {"passed": None, "Timing": "No data", "Missing": "", "Candle": None}
+    """Run the checks on the latest candle for a 'CE' (rising) or 'PE' (falling) pick: four
+    all day, plus the opening-range check while the latest candle is before EARLY_UNTIL.
+    Returns {"passed": count or None, "tier": 2 Go / 1 Almost / 0 Wait, "Timing": text,
+    "Missing": failed checks, "Candle": time}."""
+    blank = {"passed": None, "tier": 0, "Timing": "No data", "Missing": "", "Candle": None}
     if df is None or len(df) < MIN_CANDLES:
         return blank
     d = indicators(df)
@@ -82,11 +88,16 @@ def check(df, side):
         "volume": rel_vol >= MIN_REL_VOLUME,
         "rsi": last["rsi"] >= RSI_UP if up else last["rsi"] <= RSI_DOWN,
     }
+    today = last["timestamp"].date() == now_ist().date()
+    if today and last["timestamp"].strftime("%H:%M") < EARLY_UNTIL:
+        first = same_day.iloc[0]
+        ok["range"] = last["close"] > first["high"] if up else last["close"] < first["low"]
     ok = {k: bool(v) for k, v in ok.items()}          # a comparison with a blank counts as failed
-    n = sum(ok.values())
-    word = "Go" if n == 4 else "Almost" if n == 3 else "Wait"
+    n, total = sum(ok.values()), len(ok)
+    tier = 2 if n == total else 1 if n == total - 1 else 0
+    word = ("Wait", "Almost", "Go")[tier]
     return {
-        "passed": n, "Timing": f"{n}/4 {word}",
-        "Missing": ", ".join(LABELS[k] for k in LABELS if not ok[k]),
+        "passed": n, "tier": tier, "Timing": f"{n}/{total} {word}",
+        "Missing": ", ".join(LABELS[k] for k in ok if not ok[k]),
         "Candle": last["timestamp"].strftime("%d %b %H:%M"),
     }

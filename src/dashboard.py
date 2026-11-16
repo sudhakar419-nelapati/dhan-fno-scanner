@@ -24,6 +24,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import dhan_api  # noqa: E402
+import picklog  # noqa: E402
 import scanner  # noqa: E402
 import timing  # noqa: E402
 from dhan_api import ROOT, DhanError, now_ist, quotes  # noqa: E402
@@ -121,7 +122,7 @@ if st.checkbox("Full-width view (hide sidebar)", value=False):
 with st.sidebar:
     pick_count = st.slider("Top picks to show", 3, 20, 20)   # 20 = every option-scored stock
     pick_side = st.radio("Side", ("All", "CE", "PE"), horizontal=True)
-    pool_min = st.slider("Minimum scanner score", 0, 100, 50, 5)
+    pool_min = st.slider("Minimum scanner score", 0, 100, 35, 5)
     max_spread = st.slider("Flag spread above (%)", 0.5, 5.0, 1.5, 0.5)
     wall_near = st.slider("Flag wall within (%)", 0.25, 3.0, 1.0, 0.25)
     auto = st.checkbox("Auto-refresh", value=True)
@@ -129,7 +130,7 @@ with st.sidebar:
     detail = st.checkbox("Show detail tables", value=False)
     if detail:   # these only affect the detail tables
         top_n = st.slider("Stocks per side", 3, 10, 5)
-        min_score = st.slider("Minimum score", 0, 100, 40)
+        min_score = st.slider("Minimum score", 0, 100, 30)
         strike_mode = st.radio("ATM strike for the all-stocks table",
                                ("Fixed at day's open", "Follows current price"))
         debug = st.checkbox("Show API check", value=False)
@@ -206,31 +207,63 @@ def show_all_options(df):
     st.dataframe(styled, hide_index=True, height=420)
 
 
-@st.cache_data(ttl=240, show_spinner=False)
-def _timing_cached(fut_id, side):
+@st.cache_data(ttl=90, show_spinner=False)
+def _timing_cached(fut_id, side, slot):
+    # `slot` is the current 5-minute candle, so a new candle always gets a fresh download.
     return timing.check(timing.candles(fut_id), side)
 
 
 def _timing(fut_id, side):
     """Timing checks for one future. A failed download is not cached, so it is retried."""
+    t = now_ist()
     try:
-        return _timing_cached(fut_id, side)
+        return _timing_cached(fut_id, side, f"{t:%d %H}:{t.minute // 5 * 5:02d}")
     except DhanError:
-        return {"passed": None, "Timing": "No data", "Missing": "", "Candle": None}
+        return {"passed": None, "tier": 0, "Timing": "No data", "Missing": "", "Candle": None}
 
 
 @st.cache_data(ttl=55, show_spinner=False)
 def _picks(scan_time, count, side, spread_limit, wall_limit, score_floor, _res, _opts):
     # scan_time is part of the cache key, so the picks follow every new scan.
-    return top_picks(_res, _opts, _timing, count=count, side=side, max_spread=spread_limit,
-                     wall_near=wall_limit, min_score=score_floor, scan_id=scan_time)
+    picks = top_picks(_res, _opts, _timing, count=count, side=side, max_spread=spread_limit,
+                      wall_near=wall_limit, min_score=score_floor, scan_id=scan_time)
+    try:      # the log must never stop the page
+        picklog.record(picks, _res, scan_time, live=session_fraction() < 1.0)
+    except Exception as e:  # noqa: BLE001
+        st.session_state["_log_error"] = str(e)[:200]
+    return picks
+
+
+def show_log():
+    """Today's scan log: average outcome by timing group, and the file to download."""
+    with st.expander("Scan log: how today's picks did"):
+        if st.session_state.get("_log_error"):
+            st.warning(f"Scan log error: {st.session_state['_log_error']}")
+        log = picklog.load()
+        if log.empty:
+            st.info("Nothing logged yet. Picks are logged on every scan during market hours.")
+            return
+        table = picklog.summary(log)
+        if table.drop(columns=["Group", "Rows"]).notna().any().any():
+            st.dataframe(table.style.format(precision=2, na_rep="-"), hide_index=True)
+        else:
+            st.info("Outcomes appear 15 minutes after the first logged scan.")
+        st.caption("Fut % = move of the future in the pick's direction. Prem % = change in the "
+                   "option's premium. Won = share of rows with a higher premium. Each is measured "
+                   "15, 30 and 60 minutes after the scan. A stock is logged again on every scan "
+                   "it stays in the table, so rows overlap.")
+        st.download_button(f"Download log ({len(log)} rows)", log.to_csv(index=False),
+                           file_name=picklog.log_path().name, mime="text/csv")
+        if not IS_LOCAL:
+            st.caption("On the cloud this file is lost when the app restarts or sleeps: "
+                       "download it before the end of the day.")
 
 
 def show_picks(df):
     if df.empty:
         st.info("No picks: no stock is above the minimum scanner score right now.")
         return
-    lean = df.drop(columns=["Wall", "Room %", "Candle"])
+    lean = df.drop(columns=["Wall", "Room %", "Candle", "Side", "sec_id", "Fut LTP"])
     if lean["Spread %"].isna().all():     # market closed: no spread is measured, so hide the column
         lean = lean.drop(columns=["Spread %"])
 
@@ -243,7 +276,7 @@ def show_picks(df):
                 for c in row.index]
 
     formats = {"Lot cost": "{:,.0f}", "Scanner": "{:g}", "Opt lots": "{:,.0f}", "IV %": "{:.1f}",
-               "Streak": "{:g}"}
+               "Streak": "{:g}", "Chg %": "{:+.2f}", "Vol x": "{:.1f}"}
     st.dataframe(lean.style.format(formats, precision=2, na_rep="-").apply(mark, axis=1),
                  hide_index=True, height=35 * (len(lean) + 1) + 3)   # tall enough for every row
     st.caption(f"Timing uses the future's 5-minute candle that closed at {df['Candle'].dropna().max()}."
@@ -355,14 +388,19 @@ try:
         picks = _picks(scanned_at, pick_count, pick_side, max_spread, wall_near, pool_min,
                        res, opts)
     show_picks(picks)
-    st.caption("Scanner: today's futures price, OI and volume. "
+    st.caption("Scanner: today's futures price, OI and volume (full marks at a 6% move, "
+               "8% OI rise, 6x volume). Chg % = the future's move today; Vol x = cash volume "
+               "against its 10-day normal for this time of day. "
                "Timing: four checks on the future's 5-minute candles (trend, VWAP, volume, "
-               "RSI); Go = all four, Almost = three; Missing lists what failed. "
+               "RSI), plus a fifth before 09:45: a close beyond the first candle's range. "
+               "Go = all pass, Almost = one fails; Missing lists what failed. "
                "Streak: scans in a row the stock has held Go, and since when; "
                "green marks a Go held for two or more scans on a tradable option. "
                "Tradable: the at-the-money option has enough volume and a tight spread. "
                "Order: Go first, then Almost, then Wait, each by scanner score. "
                "IV is estimated from the premium.")
+
+    show_log()
 
     if detail:
         st.caption(f"Prev and Move compare with the scan at {compared_with} IST." if compared_with
