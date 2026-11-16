@@ -264,6 +264,7 @@ def show_picks(df):
         st.info("No picks: no stock is above the minimum scanner score right now.")
         return
     lean = df.drop(columns=["Wall", "Room %", "Candle", "Side", "sec_id", "Fut LTP"])
+    lean["Since"] = lean["Since"].map(lambda v: "-" if pd.isna(v) else str(v))   # not "None"
     if lean["Spread %"].isna().all():     # market closed: no spread is measured, so hide the column
         lean = lean.drop(columns=["Spread %"])
 
