@@ -12,7 +12,7 @@ MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 _LOCK = threading.Lock()
 NEEDED = ["EXCH_ID", "INSTRUMENT", "SECURITY_ID", "UNDERLYING_SECURITY_ID",
           "UNDERLYING_SYMBOL", "SERIES", "LOT_SIZE", "SM_EXPIRY_DATE",
-          "STRIKE_PRICE", "OPTION_TYPE"]
+          "STRIKE_PRICE", "OPTION_TYPE", "TICK_SIZE"]
 
 
 def build_universe(m, today):
@@ -60,6 +60,8 @@ def build_options(m, today):
         "type": nse["OPTION_TYPE"].values,
         "sec_id": nse["SECURITY_ID"].astype(int).values,
         "lot": nse["LOT_SIZE"].astype(int).values,
+        # Price step in rupees. The master gives it in paise: 5 for most stocks, 1 for cheap ones.
+        "tick": (pd.to_numeric(nse["TICK_SIZE"], errors="coerce") / 100).fillna(0.05).values,
     }).dropna(subset=["strike"])
 
 
@@ -81,7 +83,9 @@ def load_option_master():
         today = now_ist().date()
         cache = DATA / f"options_{today}.csv"
         if cache.exists():
-            return pd.read_csv(cache)
+            cached = pd.read_csv(cache)
+            if "tick" in cached.columns:      # an older cache without tick sizes is rebuilt
+                return cached
         o = build_options(pd.read_csv(_master_file(), low_memory=False), today)
         o.to_csv(cache, index=False)
         return o

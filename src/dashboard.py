@@ -121,6 +121,7 @@ if st.checkbox("Full-width view (hide sidebar)", value=False):
 with st.sidebar:
     pick_count = st.slider("Top picks to show", 3, 20, 20)   # 20 = every option-scored stock
     pick_side = st.radio("Side", ("All", "CE", "PE"), horizontal=True)
+    pool_min = st.slider("Minimum scanner score", 0, 100, 50, 5)
     max_spread = st.slider("Flag spread above (%)", 0.5, 5.0, 1.5, 0.5)
     wall_near = st.slider("Flag wall within (%)", 0.25, 3.0, 1.0, 0.25)
     auto = st.checkbox("Auto-refresh", value=True)
@@ -219,27 +220,30 @@ def _timing(fut_id, side):
 
 
 @st.cache_data(ttl=55, show_spinner=False)
-def _picks(scan_time, count, side, spread_limit, wall_limit, _res, _opts):
+def _picks(scan_time, count, side, spread_limit, wall_limit, score_floor, _res, _opts):
     # scan_time is part of the cache key, so the picks follow every new scan.
-    return top_picks(_res, _opts, _timing, count=count, side=side,
-                     max_spread=spread_limit, wall_near=wall_limit)
+    return top_picks(_res, _opts, _timing, count=count, side=side, max_spread=spread_limit,
+                     wall_near=wall_limit, min_score=score_floor, scan_id=scan_time)
 
 
 def show_picks(df):
     if df.empty:
-        st.info("No picks: no option contracts found for the scanned stocks.")
+        st.info("No picks: no stock is above the minimum scanner score right now.")
         return
     lean = df.drop(columns=["Wall", "Room %", "Candle"])
     if lean["Spread %"].isna().all():     # market closed: no spread is measured, so hide the column
         lean = lean.drop(columns=["Spread %"])
 
     def mark(row):
-        go = str(row["Timing"]).endswith("Go") and row["Tradable"] == "Yes"
+        # Green needs a Go that has held for at least two scans, on a tradable option.
+        go = (str(row["Timing"]).endswith("Go") and row["Tradable"] == "Yes"
+              and row["Streak"] >= 2)
         return ["background-color: #e8f6e8; color: #1a1a1a" if go and c in ("Symbol", "Timing") else
                 "background-color: #ffe9a8; color: #1a1a1a" if row["Alert"] and c == "Alert" else ""
                 for c in row.index]
 
-    formats = {"Lot cost": "{:,.0f}", "Scanner": "{:g}", "Opt lots": "{:,.0f}", "IV %": "{:.1f}"}
+    formats = {"Lot cost": "{:,.0f}", "Scanner": "{:g}", "Opt lots": "{:,.0f}", "IV %": "{:.1f}",
+               "Streak": "{:g}"}
     st.dataframe(lean.style.format(formats, precision=2, na_rep="-").apply(mark, axis=1),
                  hide_index=True, height=35 * (len(lean) + 1) + 3)   # tall enough for every row
     st.caption(f"Timing uses the future's 5-minute candle that closed at {df['Candle'].dropna().max()}."
@@ -348,11 +352,14 @@ try:
 
     opts = _options(day)
     with st.spinner("Checking the timing of the leading stocks..."):
-        picks = _picks(scanned_at, pick_count, pick_side, max_spread, wall_near, res, opts)
+        picks = _picks(scanned_at, pick_count, pick_side, max_spread, wall_near, pool_min,
+                       res, opts)
     show_picks(picks)
     st.caption("Scanner: today's futures price, OI and volume. "
                "Timing: four checks on the future's 5-minute candles (trend, VWAP, volume, "
                "RSI); Go = all four, Almost = three; Missing lists what failed. "
+               "Streak: scans in a row the stock has held Go, and since when; "
+               "green marks a Go held for two or more scans on a tradable option. "
                "Tradable: the at-the-money option has enough volume and a tight spread. "
                "Order: Go first, then Almost, then Wait, each by scanner score. "
                "IV is estimated from the premium.")

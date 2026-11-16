@@ -111,6 +111,18 @@ def _spread_pct(q):
         return None
 
 
+MAX_TICKS_OK = 2          # a gap of one or two price steps is as tight as a 5-paise market gets
+
+
+def _spread_ticks(q, tick):
+    """Bid-ask gap in price steps (ticks), or None if the order book is empty."""
+    try:
+        bid, ask = q["depth"]["buy"][0]["price"], q["depth"]["sell"][0]["price"]
+        return round((ask - bid) / tick) if bid and ask else None
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 MIN_OPTION_LOTS = 200     # lots traded in a full day below which an option counts as thin
 RISK_FREE = 0.065         # yearly rate used when estimating implied volatility
 
@@ -137,18 +149,46 @@ def implied_vol(premium, spot, strike, years, side, r=RISK_FREE):
     return round((low + high) / 2 * 100, 1)
 
 
-def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=1.5, wall_near=1.0):
+# How long each stock has held "Go". Shared by all browser sessions; cleared by a restart.
+_streaks = {}                           # symbol -> side, count, since, scan number, time, day
+_scan_state = {"id": None, "no": 0}
+_STREAK_MAX_GAP = 900                   # a gap of over 15 minutes between scans breaks a streak
+
+
+def _go_streak(symbol, side, is_go, scan_id):
+    """Count of consecutive scans this stock has been 'Go' on this side, and when it began.
+    Re-drawing the same scan (for example after moving a slider) does not count twice."""
+    if scan_id != _scan_state["id"]:
+        _scan_state.update(id=scan_id, no=_scan_state["no"] + 1)
+    no, now, today = _scan_state["no"], time.time(), now_ist().date()
+    st = _streaks.get(symbol)
+    if not (st and st["no"] == no and st["side"] == side):
+        carried = (st and st["side"] == side and st["no"] == no - 1 and st["count"] > 0
+                   and st["day"] == today and now - st["at"] <= _STREAK_MAX_GAP)
+        st = {"side": side, "no": no, "at": now, "day": today,
+              "count": (st["count"] + 1 if carried else 1) if is_go else 0,
+              "since": (st["since"] if carried else now_ist().strftime("%H:%M")) if is_go else None}
+        _streaks[symbol] = st
+    return st["count"], st["since"]
+
+
+def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=1.5, wall_near=1.0,
+              min_score=50, scan_id=None):
     """The short list to act on, built in three stages:
-      1. SCAN: the `pool` highest-scoring stocks on each side from the futures scan;
+      1. SCAN: the `pool` highest-scoring stocks on each side from the futures scan,
+         leaving out any below `min_score`;
       2. TIMING: `timing(fut_id, side)` checks the future's 5-minute candles (4 checks);
       3. TRADABILITY: the ATM option's spread, volume, cost, implied volatility and OI wall.
     Timing is a gate on the order, not a blended score: 'Go' rows come first, then 'Almost',
     then 'Wait', each group in scanner-score order with tradable options ahead of the rest."""
     by_symbol, lots = _strike_table(options)
     live = session_fraction() < 1.0
+    ticks_by_id = (dict(zip(options["sec_id"].astype(int), options["tick"]))
+                   if "tick" in options.columns else {})
     rows = []
     for s in (("CE", "PE") if side == "All" else (side,)):
-        for r in res[res["Side"] == s].head(pool).to_dict("records"):
+        strong = res[(res["Side"] == s) & (res["Score"] >= min_score)]
+        for r in strong.head(pool).to_dict("records"):
             g, spot = by_symbol.get(r["Symbol"]), r.get("eq_ltp")
             if g is None or pd.isna(spot) or not spot:
                 continue
@@ -162,10 +202,12 @@ def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=1.
     need_lots = max(MIN_OPTION_LOTS * session_fraction(), 20)   # scaled to the time of day
     for r in rows:
         r.update(timing(int(r["fut_id"]), r["Side"]))
+        r["streak"], r["since"] = _go_streak(r["Symbol"], r["Side"], r["passed"] == 4, scan_id)
         oq = q.get(str(r["sec_id"])) or {}
         r["premium"] = oq.get("last_price")
         # After the close the order book holds only leftover orders, so no spread is shown.
         r["spread"] = _spread_pct(oq) if live else None
+        ticks = _spread_ticks(oq, ticks_by_id.get(r["sec_id"], 0.05)) if live else None
         r["opt_lots"] = int((oq.get("volume") or 0) / r["opt_lot"]) if r["opt_lot"] else None
         expiry = datetime.strptime(str(r["expiry"]), "%Y-%m-%d").replace(hour=15, minute=30)
         years = (expiry - now_ist().replace(tzinfo=None)).total_seconds() / (365 * 24 * 3600)
@@ -175,7 +217,11 @@ def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=1.
             r["problems"].append("No option quote")
         if r["opt_lots"] is not None and r["opt_lots"] < need_lots:
             r["problems"].append(f"Thin ({r['opt_lots']} lots)")
-        if r["spread"] is not None and r["spread"] > max_spread:
+        # A cheap option can show a large % gap from a single price step (0.05 on a Rs 3 premium
+        # is 1.7%). That is not a wide market, so the % limit applies only beyond two steps.
+        # Each contract's own step is used: 5 paise for most stocks, 1 paisa for low-priced ones.
+        if (r["spread"] is not None and r["spread"] > max_spread
+                and (ticks is None or ticks > MAX_TICKS_OK)):
             r["problems"].append(f"Wide spread {r['spread']}%")
         r["tier"] = {4: 2, 3: 1}.get(r["passed"], 0)
     rows.sort(key=lambda r: (r["tier"], not r["problems"], r["Score"]), reverse=True)
@@ -202,7 +248,8 @@ def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=1.
         cost = r["premium"] * r["opt_lot"] if r["premium"] and r["opt_lot"] else None
         out.append({
             "Pick": n, "Symbol": r["Symbol"], "Scanner": r["Score"], "Signal": r["Signal"],
-            "Timing": r["Timing"], "Missing": r["Missing"],
+            "Timing": r["Timing"], "Streak": r["streak"], "Since": r["since"],
+            "Missing": r["Missing"],
             "Buy": f"{r['strike']:g} {r['Side']}", "Premium": r["premium"], "Lot cost": cost,
             "IV %": r["iv"], "Opt lots": r["opt_lots"], "Spread %": r["spread"],
             "Tradable": "No" if r["problems"] else "Yes", "Alert": ", ".join(notes),
