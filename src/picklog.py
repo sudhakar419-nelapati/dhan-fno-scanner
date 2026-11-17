@@ -18,7 +18,7 @@ from dhan_api import DATA, now_ist, quotes
 HORIZONS = (15, 30, 60)      # minutes after the pick
 WINDOW = 10                  # an outcome is filled by the first scan within this many minutes
 BASE = ["Time", "Symbol", "Side", "Buy", "Scanner", "Chg %", "Vol x", "Signal", "Timing",
-        "Streak", "Tradable", "Alert", "Fut LTP", "Premium", "sec_id"]
+        "Candle", "Streak", "Tradable", "Alert", "Fut LTP", "Premium", "sec_id"]
 OUTCOMES = [f"{kind} % +{h}m" for h in HORIZONS for kind in ("Fut", "Prem")]
 _lock = threading.Lock()
 

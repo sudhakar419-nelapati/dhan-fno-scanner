@@ -68,6 +68,12 @@ def indicators(df):
     return df
 
 
+def _candle_label(start):
+    """The 5-minute candle the checks used, as '09:15-09:20' (with the date if not today)."""
+    span = f"{start:%H:%M}-{start + pd.Timedelta(minutes=5):%H:%M}"
+    return span if start.date() == now_ist().date() else f"{start:%d %b} {span}"
+
+
 def check(df, side):
     """Run the checks on the latest candle for a 'CE' (rising) or 'PE' (falling) pick: four
     all day, plus the opening-range check while the latest candle is before EARLY_UNTIL.
@@ -99,5 +105,5 @@ def check(df, side):
     return {
         "passed": n, "tier": tier, "Timing": f"{n}/{total} {word}",
         "Missing": ", ".join(LABELS[k] for k in ok if not ok[k]),
-        "Candle": last["timestamp"].strftime("%d %b %H:%M"),
+        "Candle": _candle_label(last["timestamp"]),
     }

@@ -263,7 +263,10 @@ def show_picks(df):
     if df.empty:
         st.info("No picks: no stock is above the minimum scanner score right now.")
         return
-    lean = df.drop(columns=["Wall", "Room %", "Candle", "Side", "sec_id", "Fut LTP"])
+    lean = df.drop(columns=["Wall", "Room %", "Side", "sec_id", "Fut LTP"])
+    # The candle the timing checks used sits right after the Timing column.
+    lean.insert(lean.columns.get_loc("Timing") + 1, "Candle",
+                lean.pop("Candle").map(lambda v: "-" if pd.isna(v) else str(v)))
     lean["Since"] = lean["Since"].map(lambda v: "-" if pd.isna(v) else str(v))   # not "None"
     if lean["Spread %"].isna().all():     # market closed: no spread is measured, so hide the column
         lean = lean.drop(columns=["Spread %"])
@@ -280,8 +283,8 @@ def show_picks(df):
                "Streak": "{:g}", "Chg %": "{:+.2f}", "Vol x": "{:.1f}"}
     st.dataframe(lean.style.format(formats, precision=2, na_rep="-").apply(mark, axis=1),
                  hide_index=True, height=35 * (len(lean) + 1) + 3)   # tall enough for every row
-    st.caption(f"Timing uses the future's 5-minute candle that closed at {df['Candle'].dropna().max()}."
-               if df["Candle"].notna().any() else "No futures candles were returned.")
+    if not df["Candle"].notna().any():
+        st.caption("No futures candles were returned.")
 
 
 @st.cache_data(ttl=110, show_spinner=False)
@@ -395,6 +398,7 @@ try:
                "Timing: four checks on the future's 5-minute candles (trend, VWAP, volume, "
                "RSI), plus a fifth before 09:45: a close beyond the first candle's range. "
                "Go = all pass, Almost = one fails; Missing lists what failed. "
+               "Candle: the last completed 5-minute candle the checks used. "
                "Streak: scans in a row the stock has held Go, and since when; "
                "green marks a Go held for two or more scans on a tradable option. "
                "Tradable: the at-the-money option has enough volume and a tight spread. "
