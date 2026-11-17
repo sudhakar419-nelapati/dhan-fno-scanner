@@ -1,6 +1,8 @@
 """Stage 1: Price + Volume + OI momentum score for every F&O stock (one quote call).
 Stage 2: ATM option with gamma and other greeks for shortlisted stocks."""
+import functools
 import math
+import threading
 import time
 from datetime import datetime
 
@@ -26,6 +28,19 @@ def session_fraction():
     return max(mins, 5) / SESSION_MIN
 
 
+# The page and the background logger both scan. This lock keeps the shared memory (earlier
+# ranks, Go streaks) consistent when they run at the same moment.
+_STATE_LOCK = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def inner(*args, **kwargs):
+        with _STATE_LOCK:
+            return fn(*args, **kwargs)
+    return inner
+
+
 def _signal(pct, oi_chg):
     if pct == 0:
         return "Flat"
@@ -36,6 +51,7 @@ def _signal(pct, oi_chg):
     return "Short build-up" if oi_chg > 0 else "Long unwinding"
 
 
+@_locked
 def scan(universe, baseline):
     q = quotes({"NSE_FNO": universe["fut_id"], "NSE_EQ": universe["eq_id"]})
     fq, eq = q.get("NSE_FNO", {}), q.get("NSE_EQ", {})
@@ -161,30 +177,32 @@ def implied_vol(premium, spot, strike, years, side, r=RISK_FREE):
     return round((low + high) / 2 * 100, 1)
 
 
-# How long each stock has held "Go". Shared by all browser sessions; cleared by a restart.
-_streaks = {}                           # symbol -> side, count, since, scan number, time, day
-_scan_state = {"id": None, "no": 0}
-_STREAK_MAX_GAP = 900                   # a gap of over 15 minutes between scans breaks a streak
+# How long each stock has held "Go", counted in 5-minute candles. Shared by all browser
+# sessions; cleared by a restart.
+_streaks = {}                 # symbol -> side, count, since, candle (start time in seconds)
+_STREAK_MAX_GAP = 600         # the next candle, or one missed candle, keeps a streak alive
 
 
-def _go_streak(symbol, side, is_go, scan_id):
-    """Count of consecutive scans this stock has been 'Go' on this side, and when it began.
-    Re-drawing the same scan (for example after moving a slider) does not count twice."""
-    if scan_id != _scan_state["id"]:
-        _scan_state.update(id=scan_id, no=_scan_state["no"] + 1)
-    no, now, today = _scan_state["no"], time.time(), now_ist().date()
+def _go_streak(symbol, side, is_go, candle_ts):
+    """Number of 5-minute candles in a row on which this stock has been 'Go' on this side, and
+    when that began. Scanning the same candle again (a manual refresh, a moved slider, a
+    second phone) changes nothing: only a new candle can extend a streak."""
+    if candle_ts is None:
+        return 0, None
     st = _streaks.get(symbol)
-    if not (st and st["no"] == no and st["side"] == side):
-        carried = (st and st["side"] == side and st["no"] == no - 1 and st["count"] > 0
-                   and st["day"] == today and now - st["at"] <= _STREAK_MAX_GAP)
-        st = {"side": side, "no": no, "at": now, "day": today,
-              "count": (st["count"] + 1 if carried else 1) if is_go else 0,
-              "since": (st["since"] if carried else now_ist().strftime("%H:%M")) if is_go else None}
-        _streaks[symbol] = st
+    if st and st["side"] == side and st["candle"] == candle_ts:
+        return st["count"], st["since"]
+    gap = candle_ts - st["candle"] if st else None
+    carried = bool(st and st["side"] == side and st["count"] > 0 and 0 < gap <= _STREAK_MAX_GAP)
+    st = {"side": side, "candle": candle_ts,
+          "count": (st["count"] + 1 if carried else 1) if is_go else 0,
+          "since": (st["since"] if carried else now_ist().strftime("%H:%M")) if is_go else None}
+    _streaks[symbol] = st
     return st["count"], st["since"]
 
 
-def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=1.5, wall_near=1.0,
+@_locked
+def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=2.5, wall_near=1.0,
               min_score=35, scan_id=None):
     """The short list to act on, built in three stages:
       1. SCAN: the highest-scoring stocks on each side from the futures scan, leaving out
@@ -249,7 +267,8 @@ def top_picks(res, options, timing, count=20, pool=10, side="All", max_spread=1.
     for r in rows:
         r.update(timing(int(r["fut_id"]), r["Side"]))
         r["tier"] = r.get("tier") or 0                      # 2 = Go, 1 = Almost, 0 = Wait
-        r["streak"], r["since"] = _go_streak(r["Symbol"], r["Side"], r["tier"] == 2, scan_id)
+        r["streak"], r["since"] = _go_streak(r["Symbol"], r["Side"], r["tier"] == 2,
+                                             r.get("candle_ts"))
     rows.sort(key=lambda r: (r["tier"], not r["problems"], r["Score"]), reverse=True)
     rows = rows[:count]
 

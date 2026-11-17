@@ -5,7 +5,8 @@ whether a ranking or a 'Go' is worth acting on.
 Two outcomes are recorded per pick, both in the pick's favour (positive = it worked):
   Fut % +Nm    move of the future in the pick's direction (a fall counts as positive for a PE)
   Prem % +Nm   change in the premium of the option that was shown
-The file lives in the app's own storage: on Streamlit Cloud it is lost on a restart, so
+Picks are logged once per 5-minute slot, by whichever runs first: the background logger
+(worker.py) or an open page. The file lives in the app's own storage: on Streamlit Cloud it is lost on a restart, so
 download it from the page at the end of the day.
 """
 import threading
@@ -65,14 +66,22 @@ def _fill_outcomes(log, res, now):
     return log
 
 
+def _slot(clock):
+    """The 5-minute slot a time falls in: '10:07:25' -> '10:05'."""
+    h, m = str(clock).split(":")[:2]
+    return f"{h}:{int(m) // 5 * 5:02d}"
+
+
 def record(picks, res, scan_id, live=True):
-    """Add this scan's picks (once per scan, market hours only) and fill outcomes now due."""
+    """Add this scan's picks and fill outcomes now due. Picks are logged once per 5-minute
+    slot and only in market hours, so the page and the background logger, or several quick
+    refreshes, never log the same candle twice."""
     with _lock:
         log, now = load(), now_ist()
         before = log.copy()
         if len(log):
             log = _fill_outcomes(log, res, now)
-        if live and len(picks) and scan_id not in set(log["Time"]):
+        if live and len(picks) and _slot(scan_id) not in set(log["Time"].map(_slot)):
             new = picks.reindex(columns=[c for c in BASE if c != "Time"]).copy()
             new.insert(0, "Time", scan_id)
             new = new.reindex(columns=BASE + OUTCOMES)
@@ -85,7 +94,7 @@ def record(picks, res, scan_id, live=True):
 def _group(row):
     timing = str(row["Timing"])
     if timing.endswith("Go"):
-        return "Go, held 2+ scans" if row["Streak"] >= 2 else "Go, first scan"
+        return "Go, held 2+ candles" if row["Streak"] >= 2 else "Go, first candle"
     return "Almost" if timing.endswith("Almost") else "Wait"
 
 
@@ -94,7 +103,7 @@ def summary(log):
     if log.empty:
         return pd.DataFrame()
     df = log.assign(Group=log.apply(_group, axis=1))
-    order = ["Go, held 2+ scans", "Go, first scan", "Almost", "Wait"]
+    order = ["Go, held 2+ candles", "Go, first candle", "Almost", "Wait"]
     out = []
     for name in order:
         g = df[df["Group"] == name]
@@ -104,8 +113,8 @@ def summary(log):
         for h in HORIZONS:
             fut = pd.to_numeric(g[f"Fut % +{h}m"], errors="coerce").dropna()
             prem = pd.to_numeric(g[f"Prem % +{h}m"], errors="coerce").dropna()
-            row[f"Fut % +{h}m"] = round(fut.mean(), 2) if len(fut) else None
-            row[f"Prem % +{h}m"] = round(prem.mean(), 1) if len(prem) else None
-            row[f"Won +{h}m %"] = round((prem > 0).mean() * 100) if len(prem) else None
+            row[f"Fut % +{h}m"] = round(fut.mean(), 2) if len(fut) else float("nan")
+            row[f"Prem % +{h}m"] = round(prem.mean(), 1) if len(prem) else float("nan")
+            row[f"Won +{h}m %"] = round((prem > 0).mean() * 100) if len(prem) else float("nan")
         out.append(row)
     return pd.DataFrame(out)

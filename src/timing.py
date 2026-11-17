@@ -79,7 +79,8 @@ def check(df, side):
     all day, plus the opening-range check while the latest candle is before EARLY_UNTIL.
     Returns {"passed": count or None, "tier": 2 Go / 1 Almost / 0 Wait, "Timing": text,
     "Missing": failed checks, "Candle": time}."""
-    blank = {"passed": None, "tier": 0, "Timing": "No data", "Missing": "", "Candle": None}
+    blank = {"passed": None, "tier": 0, "Timing": "No data", "Missing": "", "Candle": None,
+             "candle_ts": None}
     if df is None or len(df) < MIN_CANDLES:
         return blank
     d = indicators(df)
@@ -106,4 +107,5 @@ def check(df, side):
         "passed": n, "tier": tier, "Timing": f"{n}/{total} {word}",
         "Missing": ", ".join(LABELS[k] for k in ok if not ok[k]),
         "Candle": _candle_label(last["timestamp"]),
+        "candle_ts": int(last["timestamp"].timestamp()),      # start of that candle
     }

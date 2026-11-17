@@ -27,6 +27,7 @@ import dhan_api  # noqa: E402
 import picklog  # noqa: E402
 import scanner  # noqa: E402
 import timing  # noqa: E402
+import worker  # noqa: E402
 from dhan_api import ROOT, DhanError, now_ist, quotes  # noqa: E402
 from scanner import atm_all, atm_option, scan, session_fraction, top_picks  # noqa: E402
 from universe import load_baseline, load_option_master, load_universe  # noqa: E402
@@ -123,7 +124,7 @@ with st.sidebar:
     pick_count = st.slider("Top picks to show", 3, 20, 20)   # 20 = every option-scored stock
     pick_side = st.radio("Side", ("All", "CE", "PE"), horizontal=True)
     pool_min = st.slider("Minimum scanner score", 0, 100, 35, 5)
-    max_spread = st.slider("Flag spread above (%)", 0.5, 5.0, 1.5, 0.5)
+    max_spread = st.slider("Flag spread above (%)", 0.5, 5.0, 2.5, 0.5)
     wall_near = st.slider("Flag wall within (%)", 0.25, 3.0, 1.0, 0.25)
     auto = st.checkbox("Auto-refresh", value=True)
     every = st.number_input("Refresh every (sec)", 60, 900, 300, 30)
@@ -159,6 +160,15 @@ if not token_ok:
     st.info("Paste today's Dhan access token in the sidebar. Generate it at web.dhan.co "
             "under My Profile > Access DhanHQ APIs; it lasts 24 hours.")
     st.stop()
+
+
+@st.cache_resource(show_spinner=False)
+def _start_logger():
+    """Starts the background logger once per app process (it then runs without any page open)."""
+    return worker.start()
+
+
+logger_status = _start_logger()
 
 
 # ---------------------------------------------------------------- data (shared by all sessions)
@@ -219,7 +229,8 @@ def _timing(fut_id, side):
     try:
         return _timing_cached(fut_id, side, f"{t:%d %H}:{t.minute // 5 * 5:02d}")
     except DhanError:
-        return {"passed": None, "tier": 0, "Timing": "No data", "Missing": "", "Candle": None}
+        return {"passed": None, "tier": 0, "Timing": "No data", "Missing": "", "Candle": None,
+                "candle_ts": None}
 
 
 @st.cache_data(ttl=55, show_spinner=False)
@@ -239,6 +250,14 @@ def show_log():
     with st.expander("Scan log: how today's picks did"):
         if st.session_state.get("_log_error"):
             st.warning(f"Scan log error: {st.session_state['_log_error']}")
+        if logger_status.get("error"):
+            st.warning(f"Background logger error at {logger_status['error']}")
+        elif logger_status.get("last"):
+            st.caption(f"Background logger: running since {logger_status['started']}, last scan "
+                       f"{logger_status['last']} ({logger_status['scans']} scans since the app started). "
+                       "It scans every 5 minutes in market hours with no page open.")
+        else:
+            st.caption("Background logger: started, waiting for market hours and a valid token.")
         log = picklog.load()
         if log.empty:
             st.info("Nothing logged yet. Picks are logged on every scan during market hours.")
@@ -250,8 +269,8 @@ def show_log():
             st.info("Outcomes appear 15 minutes after the first logged scan.")
         st.caption("Fut % = move of the future in the pick's direction. Prem % = change in the "
                    "option's premium. Won = share of rows with a higher premium. Each is measured "
-                   "15, 30 and 60 minutes after the scan. A stock is logged again on every scan "
-                   "it stays in the table, so rows overlap.")
+                   "15, 30 and 60 minutes after the scan. A stock is logged once per 5-minute "
+                   "candle while it stays in the table, so rows overlap.")
         st.download_button(f"Download log ({len(log)} rows)", log.to_csv(index=False),
                            file_name=picklog.log_path().name, mime="text/csv")
         if not IS_LOCAL:
@@ -272,7 +291,7 @@ def show_picks(df):
         lean = lean.drop(columns=["Spread %"])
 
     def mark(row):
-        # Green needs a Go that has held for at least two scans, on a tradable option.
+        # Green needs a Go that has held for at least two candles, on a tradable option.
         go = (str(row["Timing"]).endswith("Go") and row["Tradable"] == "Yes"
               and row["Streak"] >= 2)
         return ["background-color: #e8f6e8; color: #1a1a1a" if go and c in ("Symbol", "Timing") else
@@ -399,8 +418,8 @@ try:
                "RSI), plus a fifth before 09:45: a close beyond the first candle's range. "
                "Go = all pass, Almost = one fails; Missing lists what failed. "
                "Candle: the last completed 5-minute candle the checks used. "
-               "Streak: scans in a row the stock has held Go, and since when; "
-               "green marks a Go held for two or more scans on a tradable option. "
+               "Streak: 5-minute candles in a row on which the stock has held Go, and since when; "
+               "green marks a Go held for two or more candles on a tradable option. "
                "Tradable: the at-the-money option has enough volume and a tight spread. "
                "Order: Go first, then Almost, then Wait, each by scanner score. "
                "IV is estimated from the premium.")
